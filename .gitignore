@@ -1,0 +1,34 @@
+**/__pycache__
+*.py[cod]
+*$py.class
+*.egg-info/
+
+runs/
+runs_legacy/
+.vscode/
+.idea/
+
+# Logs
+sam.log
+tower.log
+stage2-1_param.log
+projector.log
+*.log
+serve_logs
+serve_images/*
+
+# Model weights and large files
+checkpoints/
+SAM/
+clip-vit-large-patch14/
+*.pth
+*.bin
+*.safetensors
+*.pt
+
+# Data
+data/
+
+# OS
+.DS_Store
+Thumbs.db
