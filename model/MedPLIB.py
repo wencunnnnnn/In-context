@@ -327,6 +327,8 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
         valid_mask_bool: torch.BoolTensor = None,
         rp_flag: bool = False,
         valid_region_masks_bool: Optional[List[torch.BoolTensor]] = None,
+        support_clip: Optional[torch.FloatTensor] = None,
+        support_mask_weights: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
         """
@@ -371,10 +373,11 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
                 ],
                 dim=1,
             )
-            # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
-            # B*q_num, 255+sequence_length
+            # hack for IMAGE_TOKEN_INDEX: SGCAFE 下只有 query 图进 LLM，固定 575
+            image_token_offset = 575
+            # B*q_num, image_token_offset+sequence_length
             seg_token_mask = torch.cat(
-                [torch.zeros((seg_token_mask.shape[0], 575)).bool().to(seg_token_mask.device), seg_token_mask],
+                [torch.zeros((seg_token_mask.shape[0], image_token_offset)).bool().to(seg_token_mask.device), seg_token_mask],
                 dim=1,
             )
 
@@ -386,6 +389,8 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
             output_hidden_states=True,
             region_masks=region_masks,
             valid_region_masks_bool=valid_region_masks_bool,
+            support_images=support_clip,
+            support_mask_weights=support_mask_weights,
         )
         # 33, B*q_num, N, 4096
         output_hidden_states = output.hidden_states
@@ -541,6 +546,8 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
         tokenizer=None,
         attention_mask=None,
         inference_demo=False,
+        support_images=None,
+        support_mask_weights=None,
     ):
         with torch.no_grad():
             outputs = self.generate(
@@ -555,6 +562,8 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
                 return_dict_in_generate=True,
                 use_cache=True,
                 attention_mask=attention_mask,
+                support_images=support_images,
+                support_mask_weights=support_mask_weights,
             )
             # get the last layer hidden states
             output_hidden_states = outputs.hidden_states
@@ -571,15 +580,6 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
                 pred_masks = []
                 return output_ids, pred_masks
             else:
-                # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
-                seg_token_mask = torch.cat(
-                    [
-                        torch.zeros((seg_token_mask.shape[0], 575)).bool().to(seg_token_mask.device),
-                        seg_token_mask,
-                    ],
-                    dim=1,
-                )
-
                 hidden_states = []
 
                 assert len(self.model.text_hidden_fcs) == 1
@@ -589,7 +589,16 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
                     hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
 
                 last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-                # B*q_num, N, 256 --> B*q_num, 255+sequence_length, 256
+                # 根据 last_hidden_state 实际长度动态计算偏移量
+                image_token_offset = last_hidden_state.shape[1] - seg_token_mask.shape[1]
+                if image_token_offset > 0:
+                    seg_token_mask = torch.cat(
+                        [
+                            torch.zeros((seg_token_mask.shape[0], image_token_offset)).bool().to(seg_token_mask.device),
+                            seg_token_mask,
+                        ],
+                        dim=1,
+                    )
                 # 确保 seg_token_mask 和 last_hidden_state 在同一设备上
                 seg_token_mask = seg_token_mask.to(last_hidden_state.device)
                 pred_embeddings = last_hidden_state[seg_token_mask]

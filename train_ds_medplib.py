@@ -130,6 +130,9 @@ def parse_args(args):
     parser.add_argument('--ep_size', type=int, default=1, help='EP size')
     parser.add_argument('--expert_pretrained_path', type=str, default=None, help='path of different MOE')
     parser.add_argument('--finetune_moe', type=bool, default=False, help='finetune on downstream task')
+    # Visual ICL (SGCAFE)
+    parser.add_argument('--use_visual_icl', action='store_true', default=False, help='Enable SGCAFE Visual ICL')
+    parser.add_argument('--support_pool_path', type=str, default=None, help='Path to support_pool.pkl')
     return parser.parse_args(args)
         
 def rank0_print(*args):
@@ -348,13 +351,17 @@ def main(args):
                 "image_processor": vision_tower.image_processor
                 }
     data_args = types.SimpleNamespace(**data_args)
-    train_dataset = LazySupervisedDataset(args.data_path, tokenizer, data_args, args.sam_img_size)
+    train_dataset = LazySupervisedDataset(args.data_path, tokenizer, data_args, args.sam_img_size,
+                                          use_visual_icl=args.use_visual_icl,
+                                          support_pool_path=args.support_pool_path)
 
     args.steps_per_epoch = math.ceil(math.ceil(len(train_dataset) / (args.batch_size * torch.cuda.device_count())) / args.grad_accumulation_steps)
 
     if args.no_eval == False:
 
-        val_dataset = LazySupervisedDataset(args.val_data_path, tokenizer, data_args, args.sam_img_size)
+        val_dataset = LazySupervisedDataset(args.val_data_path, tokenizer, data_args, args.sam_img_size,
+                                            use_visual_icl=args.use_visual_icl,
+                                            support_pool_path=args.support_pool_path)
         
         print(
             f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples. steps in one epoch: {args.steps_per_epoch}"
@@ -572,12 +579,18 @@ def train(
             if args.precision == "fp16":
                 input_dict["images"] = input_dict["images"].half()
                 input_dict["images_clip"] = input_dict["images_clip"].half()
+                if "support_clip" in input_dict:
+                    input_dict["support_clip"] = input_dict["support_clip"].half()
             elif args.precision == "bf16":
                 input_dict["images"] = input_dict["images"].bfloat16()
                 input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+                if "support_clip" in input_dict:
+                    input_dict["support_clip"] = input_dict["support_clip"].bfloat16()
             else:
                 input_dict["images"] = input_dict["images"].float()
                 input_dict["images_clip"] = input_dict["images_clip"].float()
+                if "support_clip" in input_dict:
+                    input_dict["support_clip"] = input_dict["support_clip"].float()
 
             output_dict = model(**input_dict)
 
@@ -718,12 +731,18 @@ def validate(val_loader, model_engine, epoch, writer, args):
         if args.precision == "fp16":
             input_dict["images"] = input_dict["images"].half()
             input_dict["images_clip"] = input_dict["images_clip"].half()
+            if "support_clip" in input_dict:
+                input_dict["support_clip"] = input_dict["support_clip"].half()
         elif args.precision == "bf16":
             input_dict["images"] = input_dict["images"].bfloat16()
             input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+            if "support_clip" in input_dict:
+                input_dict["support_clip"] = input_dict["support_clip"].bfloat16()
         else:
             input_dict["images"] = input_dict["images"].float()
             input_dict["images_clip"] = input_dict["images_clip"].float()
+            if "support_clip" in input_dict:
+                input_dict["support_clip"] = input_dict["support_clip"].float()
 
         with torch.no_grad():
             output_dict = model_engine(**input_dict)

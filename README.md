@@ -130,3 +130,27 @@ python model/eval/vqa_infer.py \
   --eval_seg \
   --moe_enable \
   --region_fea_adapter
+
+
+
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=3,4,5,6,7
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4 && \
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 && \
+TRANSFORMERS_OFFLINE=1 \
+python model/eval/vqa_infer.py \
+  --version="/media/userdisk2/zhli/MedPLIB/checkpoints" \
+  --vision_tower="/media/userdisk2/zhli/MedPLIB/clip-vit-large-patch14" \
+  --answer_type="open" \
+  --val_data_path="/media/userdisk2/zhli/data/MeCoVQA/test/MeCoVQA_Grounding_test.json" \
+  --image_folder="/media/userdisk2/zhli/data/SAM-MED-20M/SA-Med2D-16M/SAMed2Dv1" \
+  --vision_pretrained="/media/userdisk2/zhli/MedPLIB/SAM/sam-med2d_b.pth" \
+  --eval_seg \
+  --moe_enable \
+  --region_fea_adapter \
+  --use_visual_icl \
+  --support_pool_path="/media/userdisk2/zhli/MedPLIB/support_pool.pkl"
+
+

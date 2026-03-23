@@ -16,6 +16,7 @@ import numpy as np
 import cv2
 import random
 import time
+import pickle
 import torchvision
 import torchvision
 
@@ -108,8 +109,13 @@ def preprocess_multimodal(
     for source in sources:
         for sentence in source:
             if DEFAULT_IMAGE_TOKEN in str(sentence['value']):
-                sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
-                sentence['value'] = DEFAULT_IMAGE_TOKEN + '\n' + sentence['value']
+                # 统计 <image> token 数量，支持多图
+                num_image_tokens = sentence['value'].count(DEFAULT_IMAGE_TOKEN)
+                # 先清除所有 <image>，保留纯文本
+                text_only = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
+                # 重新构造：N 个 <image> + 换行 + 纯文本
+                image_prefix = '\n'.join([DEFAULT_IMAGE_TOKEN] * num_image_tokens)
+                sentence['value'] = image_prefix + '\n' + text_only
                 sentence['value'] = sentence['value'].strip()
                 if "mmtag" in conversation_lib.default_conversation.version:
                     sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '<Image>' + DEFAULT_IMAGE_TOKEN + '</Image>')
@@ -403,7 +409,9 @@ class LazySupervisedDataset(Dataset):
     def __init__(self, data_path: str,
                  tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments,
-                 image_size=1024):
+                 image_size=1024,
+                 use_visual_icl=False,
+                 support_pool_path=None):
         super(LazySupervisedDataset, self).__init__()
         list_data_dict = json.load(open(data_path, "r"))
 
@@ -414,6 +422,20 @@ class LazySupervisedDataset(Dataset):
         self.transform = ResizeLongestSide(image_size)
         self.clip_img_size = 336
         self.transform_clip = ResizeLongestSide(self.clip_img_size)
+
+        # Visual ICL 配置
+        self.use_visual_icl = use_visual_icl
+        self.support_pool = None
+        if use_visual_icl and support_pool_path:
+            rank0_print(f"[Visual ICL] 加载 support pool: {support_pool_path}")
+            with open(support_pool_path, "rb") as f:
+                pool_data = pickle.load(f)
+            self.pool_lv1 = pool_data["pool_lv1"]
+            self.pool_lv2 = pool_data["pool_lv2"]
+            self.pool_lv3 = pool_data["pool_lv3"]
+            self.test_key_map = pool_data["test_key_map"]
+            self.support_pool = True
+            rank0_print(f"[Visual ICL] Pool loaded: Lv1={len(self.pool_lv1)}, test_keys={len(self.test_key_map)}")
 
 
         self.list_data_dict = []
@@ -511,6 +533,58 @@ class LazySupervisedDataset(Dataset):
                 i = random.randint(0, len(self.list_data_dict) - 1)
         return self._getitem(i)
 
+    def _get_support_data(self, sample_id):
+        """
+        根据样本 id，从 support pool 中匹配，返回原始 support RGB 图和二值 mask。
+        返回 (support_rgb: np.ndarray, mask_binary: np.ndarray) 或 (None, None)。
+        """
+        if not self.support_pool or sample_id not in self.test_key_map:
+            return None, None
+
+        dataset, modality, cls = self.test_key_map[sample_id]
+
+        # 三级降级匹配
+        candidates = None
+        if (dataset, modality, cls) in self.pool_lv1:
+            candidates = self.pool_lv1[(dataset, modality, cls)]
+        elif (modality, cls) in self.pool_lv2:
+            candidates = self.pool_lv2[(modality, cls)]
+        elif (cls,) in self.pool_lv3:
+            candidates = self.pool_lv3[(cls,)]
+
+        if not candidates:
+            return None, None
+
+        # 随机选一个 support 样本
+        entry = random.choice(candidates)
+        img_path = os.path.join(self.data_args.image_folder, entry["image"])
+        mask_path = os.path.join(self.data_args.image_folder, entry["mask"])
+
+        if not os.path.exists(img_path) or not os.path.exists(mask_path):
+            return None, None
+
+        try:
+            img = Image.open(img_path).convert("RGB")
+            img_rgb = np.array(img, dtype=np.uint8)
+            mask = Image.open(mask_path).convert("L")
+            mask = mask.resize(img.size, Image.NEAREST)
+            mask_binary = (np.array(mask) > 0).astype(np.float32)
+            return img_rgb, mask_binary
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def _make_support_mask_weights(mask_binary, num_patches=575):
+        """
+        将 support 二值 mask 下采样到 CLIP patch grid (24x24=576)，
+        去掉 CLS 对应位后得到 575 维 mask weights。
+        """
+        mask_resized = cv2.resize(mask_binary, (24, 24), interpolation=cv2.INTER_AREA)
+        mask_flat = mask_resized.flatten()  # (576,)
+        # CLIP ViT-L/14 select_feature="patch" 取 [:, 1:] 去掉 CLS → 575 tokens
+        mask_weights = torch.tensor(mask_flat[:num_patches], dtype=torch.float32)
+        return mask_weights
+
     def _getitem(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
         answer_type = sources.get('answer_type', None)
@@ -563,7 +637,30 @@ class LazySupervisedDataset(Dataset):
                 # image_clip = processor.preprocess(image_rgb, return_tensors='pt')['pixel_values'][0]
             else:
                 image_clip = processor.preprocess(self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous(), False), return_tensors='pt')['pixel_values'][0]
-            
+
+            # ------------ Visual ICL (SGCAFE): 获取 support 图 + mask weights ------------
+            support_clip = None
+            support_mask_weights = None
+            if self.use_visual_icl:
+                sample_id = self.list_data_dict[i].get('id', '')
+                support_rgb, support_mask_binary = self._get_support_data(sample_id)
+                if support_rgb is not None:
+                    # 对 support 图做和 query 相同的 CLIP 预处理（不做 overlay）
+                    support_resized = self.transform_clip.apply_image(support_rgb)
+                    support_clip_tensor = self.preprocess(
+                        torch.from_numpy(support_resized).permute(2, 0, 1).contiguous(),
+                        self.clip_img_size, normalize=False)
+                    if self.data_args.image_aspect_ratio == 'pad':
+                        support_clip = processor.preprocess(support_clip_tensor, return_tensors='pt')['pixel_values'][0]
+                    else:
+                        support_clip = processor.preprocess(
+                            self.preprocess(torch.from_numpy(support_rgb).permute(2, 0, 1).contiguous(), False),
+                            return_tensors='pt')['pixel_values'][0]
+                    # 生成 mask weights (575,)
+                    support_mask_weights = self._make_support_mask_weights(support_mask_binary)
+                    # prompt 保持单图格式，不插入第二个 <image> token
+                    # 不修改对话内容，LLM 不需要知道 support 的存在
+
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
@@ -590,6 +687,10 @@ class LazySupervisedDataset(Dataset):
             data_dict['image_clip'] = image_clip
             data_dict['masks'] = masks
             data_dict['region_masks'] = region_masks
+            # Visual ICL (SGCAFE): 传递 support clip 图像 + mask weights
+            if self.use_visual_icl and support_clip is not None:
+                data_dict['support_clip'] = support_clip
+                data_dict['support_mask_weights'] = support_mask_weights
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size

@@ -336,10 +336,9 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return_dict: Optional[bool] = None,
             region_masks: Optional[List[torch.Tensor]] = None,
             valid_region_masks_bool: Optional[List[torch.BoolTensor]] = None,
+            support_images: Optional[torch.FloatTensor] = None,
+            support_mask_weights: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, MoECausalLMOutputWithPast]:
-        # print('before prepare_inputs_labels_for_multimodal')
-        # import ipdb
-        # ipdb.set_trace()
         if inputs_embeds is None:
             (
                 input_ids,
@@ -357,6 +356,8 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 region_masks,
                 valid_region_masks_bool,
+                support_images=support_images,
+                support_mask_weights=support_mask_weights,
             )
         # import ipdb
         # ipdb.set_trace()

@@ -61,6 +61,10 @@ def parse_args(args):
     parser.add_argument('--val_data_path', type=str, default='/tmp/v2_mnt/HCG/huangxiaoshuang/med-vqa-dataset/ImageClef-2019-VQA-Med/test_llavaformat_oneturn_open.json', help='Path to the JSON file containing the data.')
     parser.add_argument('--answer_type', type=str, default='closed', help='answer_type.')
 
+    # Visual ICL 参数
+    parser.add_argument('--use_visual_icl', action='store_true', default=False, help='Enable Visual In-Context Learning.')
+    parser.add_argument('--support_pool_path', type=str, default=None, help='Path to support_pool.pkl for Visual ICL.')
+
 
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=1, type=int)
@@ -289,6 +293,12 @@ def main(args):
         text_hidden_fcs.to(dtype=torch_dtype, device="cuda:0")
         print(f"[INFO] text_hidden_fcs hooks removed, moved to device: cuda:0")
 
+        # 4. SGCAFE module
+        sgcafe = model.get_model().sgcafe
+        remove_hook_from_submodules(sgcafe)
+        sgcafe.to(dtype=torch_dtype, device="cuda:0")
+        print(f"[INFO] SGCAFE hooks removed, moved to device: cuda:0")
+
         input_device = torch.device("cuda:0")
 
     if args.local_rank == 0:
@@ -323,7 +333,9 @@ def main(args):
 
     data_args = types.SimpleNamespace(**data_args)
 
-    val_dataset = LazySupervisedDataset(args.val_data_path, tokenizer, data_args, args.sam_img_size)
+    val_dataset = LazySupervisedDataset(args.val_data_path, tokenizer, data_args, args.sam_img_size,
+                                        use_visual_icl=args.use_visual_icl,
+                                        support_pool_path=args.support_pool_path)
 
     if args.eval_vqa:
         val_indices = get_chunk(range(len(val_dataset)), args.num_chunks, args.chunk_idx)
@@ -547,13 +559,28 @@ def validate_seg(val_loader, model_engine, epoch, args, tokenizer, fea_hooks=Non
             input_dict = dict_to_cuda(input_dict, device=input_device)
         if args.precision == "fp16":
             input_dict["images"] = input_dict["images"].half()
-            input_dict["images_clip"] = input_dict["images_clip"].half()
+            if isinstance(input_dict["images_clip"], list):
+                input_dict["images_clip"] = [x.half() for x in input_dict["images_clip"]]
+            else:
+                input_dict["images_clip"] = input_dict["images_clip"].half()
+            if "support_clip" in input_dict:
+                input_dict["support_clip"] = input_dict["support_clip"].half()
         elif args.precision == "bf16":
             input_dict["images"] = input_dict["images"].bfloat16()
-            input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+            if isinstance(input_dict["images_clip"], list):
+                input_dict["images_clip"] = [x.bfloat16() for x in input_dict["images_clip"]]
+            else:
+                input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
+            if "support_clip" in input_dict:
+                input_dict["support_clip"] = input_dict["support_clip"].bfloat16()
         else:
             input_dict["images"] = input_dict["images"].float()
-            input_dict["images_clip"] = input_dict["images_clip"].float()
+            if isinstance(input_dict["images_clip"], list):
+                input_dict["images_clip"] = [x.float() for x in input_dict["images_clip"]]
+            else:
+                input_dict["images_clip"] = input_dict["images_clip"].float()
+            if "support_clip" in input_dict:
+                input_dict["support_clip"] = input_dict["support_clip"].float()
 
         indices = (input_dict['input_ids'] == 29901).nonzero(as_tuple=True)
         input_ids = input_dict['input_ids'][:, :indices[1][-1]+1]
@@ -568,7 +595,9 @@ def validate_seg(val_loader, model_engine, epoch, args, tokenizer, fea_hooks=Non
             input_dict['label_list'],
             max_new_tokens=1024,
             tokenizer=tokenizer,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            support_images=input_dict.get('support_clip', None),
+            support_mask_weights=input_dict.get('support_mask_weights', None),
         )
         if fea_hooks is not None:
 

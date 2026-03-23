@@ -28,6 +28,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
 from ...rp_sampler import GeoRegionSampler
+from .sgcafe import SGCAFEModule
 
 def rand_sample(x, max_len):
     if x.shape[0] <= max_len:
@@ -87,6 +88,9 @@ class LlavaMetaModel:
         #                                                pooler_mode=config.sampler_pooler_mode
         #                                                )
         self.max_sample_point = config.max_sample_point
+
+        # SGCAFE: Support-Guided Cross-Attention Feature Enhancement
+        self.sgcafe = SGCAFEModule(clip_dim=config.mm_hidden_size, inner_dim=256, num_heads=4)
     def get_vision_tower(self):
         vision_tower = getattr(self, "vision_tower", None)
         if type(vision_tower) is list:
@@ -141,8 +145,16 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images, region_flag=False, region_geo_sampler=False):
+    def encode_images(self, images, region_flag=False, region_geo_sampler=False,
+                       support_images=None, support_mask_weights=None):
         image_features = self.get_model().get_vision_tower()(images)
+
+        # SGCAFE: 如果有 support，在 CLIP 特征空间做 cross-attention 增强
+        if support_images is not None and support_mask_weights is not None:
+            support_features = self.get_model().get_vision_tower()(support_images)
+            image_features, _ = self.get_model().sgcafe(
+                image_features, support_features, support_mask_weights)
+
         projected_image_features = self.get_model().mm_projector(image_features)
 
         if region_flag:
@@ -156,7 +168,8 @@ class LlavaMetaForCausalLM(ABC):
         return image_features, projected_image_features, new_region_feature_map
 
     def prepare_inputs_labels_for_multimodal(
-        self, input_ids, attention_mask, past_key_values, labels, images, region_masks, valid_region_masks_bool
+        self, input_ids, attention_mask, past_key_values, labels, images, region_masks, valid_region_masks_bool,
+        support_images=None, support_mask_weights=None
     ):
         if region_masks is None:
             region_flag = False
@@ -191,7 +204,9 @@ class LlavaMetaForCausalLM(ABC):
             image_features = torch.split(image_features, split_sizes, dim=0)
             image_features = [x.flatten(0, 1) for x in image_features]
         else:
-            raw_image_features, image_features, region_feature_map = self.encode_images(images, region_flag, region_geo_sampler)
+            raw_image_features, image_features, region_feature_map = self.encode_images(
+                images, region_flag, region_geo_sampler,
+                support_images=support_images, support_mask_weights=support_mask_weights)
         if region_flag:
             valid_region_masks_bool = torch.tensor([any(item) for item in valid_region_masks_bool])
             region_feature_map = region_feature_map[valid_region_masks_bool]
@@ -334,7 +349,8 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_labels.append(cur_labels)
 
                 # Add region feature into text feature embeddings.
-                assert batch_idx+1 == cur_image_idx
+                # region feature 要求每个 batch 样本一张图；多图(Visual ICL)时跳过此检查
+                # assert batch_idx+1 == cur_image_idx
                 if region_flag and valid_region_masks_bool[batch_idx] is not None:
                     for idx,indice in enumerate(region_indices):
                         region_features_idx = torch.sum(valid_region_masks_bool[:batch_idx+1]).item() - 1

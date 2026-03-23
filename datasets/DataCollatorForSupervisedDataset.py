@@ -54,7 +54,7 @@ def DataCollatorForSupervisedDataset(list_data_dict: Sequence[Dict], inference: 
     region_masks = []
     valid_region_masks_bool = []
     max_region_masks_nums = max([len(instance['region_masks']) for instance in list_data_dict])
-    
+
     rp_flag = False
     if max_region_masks_nums > 0:
         rp_flag = True
@@ -68,9 +68,9 @@ def DataCollatorForSupervisedDataset(list_data_dict: Sequence[Dict], inference: 
     image_path_list = []
     images_list = []
     images_clip_list = []
+    support_clip_list = []
+    support_mask_weights_list = []
     conversation_list = []
-    # resize_list = []
-    # label_list = []
     questions_list = []
     gts_list = []
     sampled_classes_list = []
@@ -80,10 +80,13 @@ def DataCollatorForSupervisedDataset(list_data_dict: Sequence[Dict], inference: 
     for data_dict in list_data_dict:
         image_path_list.append(data_dict.get('image_path', None))
         images_list.append(data_dict.get('image_sam', None))
+        # SGCAFE: query image 始终作为单图传递（不再拼接 support）
         images_clip_list.append(data_dict.get('image_clip', None))
+        # SGCAFE: support 数据作为独立字段
+        if 'support_clip' in data_dict:
+            support_clip_list.append(data_dict['support_clip'])
+            support_mask_weights_list.append(data_dict['support_mask_weights'])
         conversation_list.extend(data_dict.get('conversations', None))
-        # label_list.append(data_dict.get('label', torch.tensor([])))
-        # resize_list.append(data_dict.get('resize', None))
         questions_list.append(data_dict.get('question', None))
         gts_list.append(data_dict.get('gt', None))
         sampled_classes_list.append(data_dict.get('sampled_classes', None))
@@ -91,10 +94,13 @@ def DataCollatorForSupervisedDataset(list_data_dict: Sequence[Dict], inference: 
         offset_list.append(cnt)
         answer_type_list.append(data_dict.get('answer_type', None))
 
+    # images_clip 始终 stack 为单图 tensor (B, 3, H, W)
+    images_clip_final = torch.stack(images_clip_list, dim=0)
+
     final_batch = {
             "image_paths": image_path_list,
             "images": torch.stack(images_list, dim=0),
-            "images_clip": torch.stack(images_clip_list, dim=0),
+            "images_clip": images_clip_final,
             "input_ids": batch['input_ids'],
             "labels": batch['labels'],
             "attention_mask": batch['attention_mask'],
@@ -114,4 +120,10 @@ def DataCollatorForSupervisedDataset(list_data_dict: Sequence[Dict], inference: 
             "region_masks": region_masks,
             "valid_region_masks_bool": valid_region_masks_bool,
         }
+
+    # SGCAFE: 只有当 batch 中所有样本都有 support 时才传递
+    if len(support_clip_list) == len(list_data_dict) and len(support_clip_list) > 0:
+        final_batch["support_clip"] = torch.stack(support_clip_list, dim=0)
+        final_batch["support_mask_weights"] = torch.stack(support_mask_weights_list, dim=0)
+
     return final_batch
