@@ -70,6 +70,7 @@ def DataCollatorForSupervisedDataset(list_data_dict: Sequence[Dict], inference: 
     images_clip_list = []
     support_clip_list = []
     support_mask_weights_list = []
+    icl_region_clip_list = []
     conversation_list = []
     questions_list = []
     gts_list = []
@@ -80,12 +81,13 @@ def DataCollatorForSupervisedDataset(list_data_dict: Sequence[Dict], inference: 
     for data_dict in list_data_dict:
         image_path_list.append(data_dict.get('image_path', None))
         images_list.append(data_dict.get('image_sam', None))
-        # SGCAFE: query image 始终作为单图传递（不再拼接 support）
         images_clip_list.append(data_dict.get('image_clip', None))
         # SGCAFE: support 数据作为独立字段
         if 'support_clip' in data_dict:
             support_clip_list.append(data_dict['support_clip'])
             support_mask_weights_list.append(data_dict['support_mask_weights'])
+        if 'icl_region_clip' in data_dict:
+            icl_region_clip_list.append(data_dict['icl_region_clip'])
         conversation_list.extend(data_dict.get('conversations', None))
         questions_list.append(data_dict.get('question', None))
         gts_list.append(data_dict.get('gt', None))
@@ -94,8 +96,34 @@ def DataCollatorForSupervisedDataset(list_data_dict: Sequence[Dict], inference: 
         offset_list.append(cnt)
         answer_type_list.append(data_dict.get('answer_type', None))
 
-    # images_clip 始终 stack 为单图 tensor (B, 3, H, W)
-    images_clip_final = torch.stack(images_clip_list, dim=0)
+    # images_clip: 支持单图 tensor 和多图 list 两种格式
+    # Token ICL 模式下 image_clip 是 list of tensors，普通模式下是单个 tensor
+    has_token_icl = any(isinstance(d.get('image_clip', None), list) for d in list_data_dict)
+    if has_token_icl:
+        # Token ICL: 每个样本的 image_clip 是 [support_clip..., query_clip] 的 list
+        # 将每个样本的多图 stack 成 (num_images, C, H, W)，再 batch stack 成 (B, num_images, C, H, W)
+        # medplib_arch.py 中 images.ndim == 5 分支会 reshape 为 (B*num_images, C, H, W) 统一处理
+        num_images_per_sample = max(
+            len(d['image_clip']) if isinstance(d['image_clip'], list) else 1
+            for d in list_data_dict
+        )
+        stacked_samples = []
+        for d in list_data_dict:
+            clip_data = d.get('image_clip', None)
+            if isinstance(clip_data, list):
+                # 如果图片数少于 max（不应该发生，但防御性处理），用零填充
+                while len(clip_data) < num_images_per_sample:
+                    clip_data.append(torch.zeros_like(clip_data[0]))
+                stacked_samples.append(torch.stack(clip_data, dim=0))  # (num_images, C, H, W)
+            else:
+                # 非 ICL 样本：query 图放在最前面，其余用零填充
+                # 因为它的 input_ids 里只有 1 个 <image> token，
+                # prepare_inputs_labels_for_multimodal 中 cur_image_idx 只取第一个
+                padding = [clip_data] + [torch.zeros_like(clip_data)] * (num_images_per_sample - 1)
+                stacked_samples.append(torch.stack(padding, dim=0))  # (num_images, C, H, W)
+        images_clip_final = torch.stack(stacked_samples, dim=0)  # (B, num_images, C, H, W)
+    else:
+        images_clip_final = torch.stack(images_clip_list, dim=0)
 
     final_batch = {
             "image_paths": image_path_list,
@@ -125,5 +153,9 @@ def DataCollatorForSupervisedDataset(list_data_dict: Sequence[Dict], inference: 
     if len(support_clip_list) == len(list_data_dict) and len(support_clip_list) > 0:
         final_batch["support_clip"] = torch.stack(support_clip_list, dim=0)
         final_batch["support_mask_weights"] = torch.stack(support_mask_weights_list, dim=0)
+
+    # Region ICL: 传递 support 图的 CLIP tensor
+    if len(icl_region_clip_list) == len(list_data_dict) and len(icl_region_clip_list) > 0:
+        final_batch["icl_region_clip"] = torch.stack(icl_region_clip_list, dim=0)
 
     return final_batch

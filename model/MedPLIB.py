@@ -329,6 +329,7 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
         valid_region_masks_bool: Optional[List[torch.BoolTensor]] = None,
         support_clip: Optional[torch.FloatTensor] = None,
         support_mask_weights: Optional[torch.FloatTensor] = None,
+        icl_region_clip: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
         """
@@ -373,14 +374,25 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
                 ],
                 dim=1,
             )
-            # hack for IMAGE_TOKEN_INDEX: SGCAFE 下只有 query 图进 LLM，固定 575
-            image_token_offset = 575
-            # B*q_num, image_token_offset+sequence_length
-            seg_token_mask = torch.cat(
-                [torch.zeros((seg_token_mask.shape[0], image_token_offset)).bool().to(seg_token_mask.device), seg_token_mask],
-                dim=1,
-            )
+            # hack for IMAGE_TOKEN_INDEX: 576 image tokens 替换 1 个 IMAGE_TOKEN_INDEX，净增 575
+            # 动态计算：支持多图（Token ICL 模式下可能有 2 或 3 个 <image>）
+            # per-sample 计算，避免 batch 中图片数量不一致时的偏移问题
+            num_image_tokens_per_sample = (input_ids == -200).sum(dim=1)  # (B*q_num,)
+            max_image_token_offset = 575 * max(num_image_tokens_per_sample.max().item(), 1)
+            # 对每个样本生成不同长度的 padding，然后统一 pad 到 max
+            padded_masks = []
+            for sample_idx in range(seg_token_mask.shape[0]):
+                sample_offset = 575 * max(num_image_tokens_per_sample[sample_idx].item(), 1)
+                sample_mask = seg_token_mask[sample_idx]  # (sequence_length,)
+                # 前面 pad sample_offset 个 False，后面 pad 到 max_image_token_offset
+                pad_left = torch.zeros(sample_offset, dtype=torch.bool, device=seg_token_mask.device)
+                pad_right = torch.zeros(max_image_token_offset - sample_offset, dtype=torch.bool, device=seg_token_mask.device)
+                padded_masks.append(torch.cat([pad_left, sample_mask, pad_right], dim=0))
+            seg_token_mask = torch.stack(padded_masks, dim=0)
 
+        # Token ICL 模式下 support 已经作为 image token 输入，不走 SGCAFE
+        # Token ICL 的 images_clip 是 5D tensor (B, num_images, C, H, W)
+        is_token_icl = isinstance(images_clip, torch.Tensor) and images_clip.ndim == 5
         output = super().forward(
             images=images_clip,
             attention_mask=attention_mask,
@@ -389,8 +401,9 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
             output_hidden_states=True,
             region_masks=region_masks,
             valid_region_masks_bool=valid_region_masks_bool,
-            support_images=support_clip,
-            support_mask_weights=support_mask_weights,
+            support_images=None if is_token_icl else support_clip,
+            support_mask_weights=None if is_token_icl else support_mask_weights,
+            icl_region_clip=icl_region_clip,
         )
         # 33, B*q_num, N, 4096
         output_hidden_states = output.hidden_states
@@ -409,6 +422,8 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
                 "unscale_mask_loss": torch.zeros_like(ce_loss),
                 "unscale_mask_iou_loss": torch.zeros_like(ce_loss),
                 "unscale_mask_focal_loss": torch.zeros_like(ce_loss),
+                "loss_align": torch.zeros_like(ce_loss),
+                "loss_seg_weak": torch.zeros_like(ce_loss),
             }
 
 
@@ -520,6 +535,49 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
 
         loss = ce_loss + mask_loss
 
+        # --- SGCAFE 辅助损失 ---
+        loss_align = torch.zeros_like(ce_loss)
+        loss_seg_weak = torch.zeros_like(ce_loss)
+        sgcafe_extras = getattr(self.model, '_sgcafe_extras', None)
+        if sgcafe_extras is not None and not sgcafe_extras['support_dropped'] and seg_flag and len(masks_list) > 0:
+            # 获取 query GT mask 并下采样到 24x24
+            # masks_list 中每个元素是 (H, W) 的 GT mask
+            gt_masks_cat = torch.stack(
+                [F.interpolate(m.unsqueeze(0).unsqueeze(0).float(), size=(24, 24), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+                 for m in masks_list], dim=0)  # (num_masks, 24, 24)
+            # 取 batch 中第一个 mask 作为 query mask 的代表（每张图通常只有一个 seg target）
+            # 注意: SGCAFE 的 batch 维度对应图像数（不是 mask 数），取每张图的第一个 mask
+            query_mask_down = gt_masks_cat[0:1].flatten(1)  # (1, 576)
+            query_mask_down = query_mask_down.clamp(0, 1)
+
+            # L_align: cross-attention 与 query mask 对齐
+            # attn_map: (B, num_heads, N, N) -> 多头平均 -> (B, N, N)
+            attn_mean = sgcafe_extras['attn_map'].mean(dim=1).float()  # (B, N, N)
+            s_mask = sgcafe_extras['support_mask_weights'].float()  # (B, N)
+            # 每个 query token 对 support 前景区域的总关注度
+            attn_to_fg = (attn_mean * s_mask.unsqueeze(1)).sum(-1)  # (B, N)
+            # 用 with_logits 版本避免 BCE 的 [0,1] assert 问题
+            # 先把 attn_to_fg 从概率空间转回 logit 空间
+            attn_to_fg = attn_to_fg.clamp(1e-6, 1 - 1e-6)
+            attn_to_fg_logit = torch.log(attn_to_fg / (1 - attn_to_fg))  # inverse sigmoid
+            query_mask_down_safe = query_mask_down.float().clamp(0, 1)
+            loss_align = F.binary_cross_entropy_with_logits(
+                attn_to_fg_logit[:1], query_mask_down_safe,  # 只取第一张图
+            )
+
+            # L_seg_weak: aux_head 弱分割损失
+            aux_pred = sgcafe_extras['aux_pred'][:1].flatten(1).float()  # (1, 576)
+            loss_seg_weak = F.binary_cross_entropy_with_logits(aux_pred, query_mask_down)
+
+            # 整合辅助损失
+            align_weight = getattr(self, 'align_loss_weight', 1.0)
+            seg_weak_weight = getattr(self, 'seg_weak_loss_weight', 0.1)
+            loss = loss + align_weight * loss_align + seg_weak_weight * loss_seg_weak
+
+        # 清理临时属性
+        if hasattr(self.model, '_sgcafe_extras'):
+            self.model._sgcafe_extras = None
+
         return {
             "loss": loss,
             "ce_loss": ce_loss,
@@ -531,6 +589,8 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
             "unscale_mask_loss": unscale_mask_loss,
             "unscale_mask_iou_loss": unscale_mask_iou_loss,
             "unscale_mask_focal_loss": unscale_mask_focal_loss,
+            "loss_align": loss_align,
+            "loss_seg_weak": loss_seg_weak,
         }
 
     def evaluate(
@@ -548,6 +608,7 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
         inference_demo=False,
         support_images=None,
         support_mask_weights=None,
+        icl_region_clip=None,
     ):
         with torch.no_grad():
             outputs = self.generate(
@@ -564,6 +625,7 @@ class MedPLIBForCausalLM(MedPLIBMoELlamaForCausalLM):
                 attention_mask=attention_mask,
                 support_images=support_images,
                 support_mask_weights=support_mask_weights,
+                icl_region_clip=icl_region_clip,
             )
             # get the last layer hidden states
             output_hidden_states = outputs.hidden_states

@@ -64,6 +64,12 @@ def parse_args(args):
     # Visual ICL 参数
     parser.add_argument('--use_visual_icl', action='store_true', default=False, help='Enable Visual In-Context Learning.')
     parser.add_argument('--support_pool_path', type=str, default=None, help='Path to support_pool.pkl for Visual ICL.')
+    # Token ICL 参数
+    parser.add_argument('--use_token_icl_concat', action='store_true', default=False, help='Token ICL: 横向拼接 support+mask, 2图输入LLM')
+    parser.add_argument('--use_token_icl_multi', action='store_true', default=False, help='Token ICL: support+mask+query, 3图输入LLM')
+    # Region ICL 参数
+    parser.add_argument('--use_region_icl', action='store_true', default=False, help='Region ICL: 通过 Vision Prompt Encoder 注入 support 区域特征')
+    parser.add_argument('--region_icl_self', action='store_true', default=False, help='Region ICL 极端实验: 用自身 GT mask 作为上下文')
 
 
     parser.add_argument("--val_batch_size", default=1, type=int)
@@ -297,7 +303,17 @@ def main(args):
         sgcafe = model.get_model().sgcafe
         remove_hook_from_submodules(sgcafe)
         sgcafe.to(dtype=torch_dtype, device="cuda:0")
-        print(f"[INFO] SGCAFE hooks removed, moved to device: cuda:0")
+        # 强制重新初始化 gate，防止 from_pretrained 默认初始化覆盖自定义值
+        sgcafe._init_weights()
+        sgcafe.to(dtype=torch_dtype, device="cuda:0")  # 重新移到正确 dtype/device
+        # 验证 gate 初始化
+        with torch.no_grad():
+            test_input = torch.zeros(1, 576, sgcafe.clip_dim, dtype=torch_dtype, device="cuda:0")
+            gate_val = torch.sigmoid(sgcafe.gate_proj(test_input))
+            print(f"[INFO] SGCAFE gate value (should be ~0): mean={gate_val.mean().item():.8f}, max={gate_val.max().item():.8f}")
+        print(f"[INFO] SGCAFE gate_proj.bias[:4] = {sgcafe.gate_proj.bias.data[:4].tolist()}")
+        print(f"[INFO] SGCAFE gate_proj.weight absmax = {sgcafe.gate_proj.weight.data.abs().max().item():.6f}")
+        print(f"[INFO] SGCAFE hooks removed, gate re-initialized, moved to device: cuda:0")
 
         input_device = torch.device("cuda:0")
 
@@ -335,7 +351,11 @@ def main(args):
 
     val_dataset = LazySupervisedDataset(args.val_data_path, tokenizer, data_args, args.sam_img_size,
                                         use_visual_icl=args.use_visual_icl,
-                                        support_pool_path=args.support_pool_path)
+                                        support_pool_path=args.support_pool_path,
+                                        use_token_icl_concat=args.use_token_icl_concat,
+                                        use_token_icl_multi=args.use_token_icl_multi,
+                                        use_region_icl=args.use_region_icl,
+                                        region_icl_self=args.region_icl_self)
 
     if args.eval_vqa:
         val_indices = get_chunk(range(len(val_dataset)), args.num_chunks, args.chunk_idx)
@@ -565,6 +585,8 @@ def validate_seg(val_loader, model_engine, epoch, args, tokenizer, fea_hooks=Non
                 input_dict["images_clip"] = input_dict["images_clip"].half()
             if "support_clip" in input_dict:
                 input_dict["support_clip"] = input_dict["support_clip"].half()
+            if "icl_region_clip" in input_dict:
+                input_dict["icl_region_clip"] = input_dict["icl_region_clip"].half()
         elif args.precision == "bf16":
             input_dict["images"] = input_dict["images"].bfloat16()
             if isinstance(input_dict["images_clip"], list):
@@ -573,6 +595,8 @@ def validate_seg(val_loader, model_engine, epoch, args, tokenizer, fea_hooks=Non
                 input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
             if "support_clip" in input_dict:
                 input_dict["support_clip"] = input_dict["support_clip"].bfloat16()
+            if "icl_region_clip" in input_dict:
+                input_dict["icl_region_clip"] = input_dict["icl_region_clip"].bfloat16()
         else:
             input_dict["images"] = input_dict["images"].float()
             if isinstance(input_dict["images_clip"], list):
@@ -581,23 +605,30 @@ def validate_seg(val_loader, model_engine, epoch, args, tokenizer, fea_hooks=Non
                 input_dict["images_clip"] = input_dict["images_clip"].float()
             if "support_clip" in input_dict:
                 input_dict["support_clip"] = input_dict["support_clip"].float()
+            if "icl_region_clip" in input_dict:
+                input_dict["icl_region_clip"] = input_dict["icl_region_clip"].float()
 
         indices = (input_dict['input_ids'] == 29901).nonzero(as_tuple=True)
         input_ids = input_dict['input_ids'][:, :indices[1][-1]+1]
         attention_mask = input_dict['attention_mask'][:, :indices[1][-1]+1]
         with torch.no_grad():
             # output_dict = model_engine(**input_dict)
+            # Token ICL 模式下 support 已作为 image token 输入，不走 SGCAFE
+            is_token_icl = isinstance(input_dict["images_clip"], torch.Tensor) and input_dict["images_clip"].ndim == 5
             output_ids, pred_masks = model_engine.evaluate(
             input_dict["images_clip"],
             input_dict["images"],
             input_ids,
             input_dict['resize_list'],
             input_dict['label_list'],
+            region_masks=input_dict.get('region_masks', []),
+            valid_region_masks_bool=input_dict.get('valid_region_masks_bool', []),
             max_new_tokens=1024,
             tokenizer=tokenizer,
             attention_mask=attention_mask,
-            support_images=input_dict.get('support_clip', None),
-            support_mask_weights=input_dict.get('support_mask_weights', None),
+            support_images=None if is_token_icl else input_dict.get('support_clip', None),
+            support_mask_weights=None if is_token_icl else input_dict.get('support_mask_weights', None),
+            icl_region_clip=input_dict.get('icl_region_clip', None),
         )
         if fea_hooks is not None:
 

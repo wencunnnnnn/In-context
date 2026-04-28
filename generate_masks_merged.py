@@ -21,20 +21,31 @@ MASKS_DIR = os.path.join(DATA_ROOT, "masks")
 MERGED_DIR = os.path.join(DATA_ROOT, "masks_merged")
 GROUNDING_JSON = "/media/userdisk2/zhli/data/MeCoVQA/test/MeCoVQA_Grounding_test.json"
 
+# 零样本推理数据
+ZEROSHOT_DIR = "/media/userdisk2/zhli/data/MeCoVQA/zeroshot4grounding"
+ZEROSHOT_JSONS = [
+    os.path.join(ZEROSHOT_DIR, f) for f in
+    ["endoscopy.json", "fundus.json", "mr.json", "pet.json", "ultrasound.json", "xray.json"]
+]
+
 def main():
     os.makedirs(MERGED_DIR, exist_ok=True)
 
     # 1. 从 JSON 中提取所有 masks_merged 路径
-    with open(GROUNDING_JSON, "r") as f:
-        data = json.load(f)
-
+    all_jsons = [GROUNDING_JSON] + ZEROSHOT_JSONS
     merged_paths = []
-    for item in data:
-        for conv in item.get("conversations", []):
-            val = conv.get("value", "")
-            m = re.search(r"<mask>(masks_merged/.*?)</mask>", val)
-            if m:
-                merged_paths.append(m.group(1))
+    for json_path in all_jsons:
+        if not os.path.exists(json_path):
+            print(f"  [WARN] 文件不存在，跳过: {json_path}")
+            continue
+        with open(json_path, "r") as f:
+            data = json.load(f)
+        for item in data:
+            for conv in item.get("conversations", []):
+                val = conv.get("value", "")
+                m = re.search(r"<mask>(masks_merged/.*?)</mask>", val)
+                if m:
+                    merged_paths.append(m.group(1))
 
     print(f"需要生成 {len(merged_paths)} 个 merged mask")
 

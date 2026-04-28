@@ -133,6 +133,12 @@ def parse_args(args):
     # Visual ICL (SGCAFE)
     parser.add_argument('--use_visual_icl', action='store_true', default=False, help='Enable SGCAFE Visual ICL')
     parser.add_argument('--support_pool_path', type=str, default=None, help='Path to support_pool.pkl')
+    parser.add_argument('--training_stage', type=int, default=0, help='0=normal, 1=SGCAFE alignment pretraining')
+    parser.add_argument('--align_loss_weight', type=float, default=1.0, help='Weight for L_align')
+    parser.add_argument('--seg_weak_loss_weight', type=float, default=0.1, help='Weight for L_seg_weak')
+    # Token ICL: support 图编码成 token 直接输入 LLM
+    parser.add_argument('--use_token_icl_concat', action='store_true', default=False, help='Token ICL: 横向拼接 support+mask 为1图, 共2图输入LLM')
+    parser.add_argument('--use_token_icl_multi', action='store_true', default=False, help='Token ICL: support原图+mask黑白图+query, 共3图输入LLM')
     return parser.parse_args(args)
         
 def rank0_print(*args):
@@ -297,8 +303,8 @@ def main(args):
         for n, p in model.named_parameters():
             p.requires_grad = False
         
-    if args.moe_enable:
-        # load moe weights
+    if args.moe_enable and getattr(args, 'training_stage', 0) != 1:
+        # load moe weights (Stage 1 只训 SGCAFE，checkpoint 已含完整 MoE 权重，跳过)
         model.initialize_moe_modules(args)
 
     model.resize_token_embeddings(len(tokenizer))
@@ -316,6 +322,19 @@ def main(args):
             ):
                 # print("n: ", n, "p.shape: ", p.shape)
                 p.requires_grad = True
+
+    # Stage 1: 只训练 SGCAFE，冻结所有其他参数
+    if args.training_stage == 1:
+        model.requires_grad_(False)
+        for p in model.get_model().sgcafe.parameters():
+            p.requires_grad = True
+        if args.local_rank == 0:
+            sgcafe_params = sum(p.numel() for p in model.get_model().sgcafe.parameters() if p.requires_grad)
+            print(f"[Stage 1] Only SGCAFE trainable: {sgcafe_params} params")
+
+    # 传递辅助损失权重到模型
+    model.align_loss_weight = args.align_loss_weight
+    model.seg_weak_loss_weight = args.seg_weak_loss_weight
 
     # if args.local_rank == 0:
     #     for name, param in model.named_parameters():
@@ -353,7 +372,9 @@ def main(args):
     data_args = types.SimpleNamespace(**data_args)
     train_dataset = LazySupervisedDataset(args.data_path, tokenizer, data_args, args.sam_img_size,
                                           use_visual_icl=args.use_visual_icl,
-                                          support_pool_path=args.support_pool_path)
+                                          support_pool_path=args.support_pool_path,
+                                          use_token_icl_concat=args.use_token_icl_concat,
+                                          use_token_icl_multi=args.use_token_icl_multi)
 
     args.steps_per_epoch = math.ceil(math.ceil(len(train_dataset) / (args.batch_size * torch.cuda.device_count())) / args.grad_accumulation_steps)
 
@@ -361,7 +382,9 @@ def main(args):
 
         val_dataset = LazySupervisedDataset(args.val_data_path, tokenizer, data_args, args.sam_img_size,
                                             use_visual_icl=args.use_visual_icl,
-                                            support_pool_path=args.support_pool_path)
+                                            support_pool_path=args.support_pool_path,
+                                            use_token_icl_concat=args.use_token_icl_concat,
+                                            use_token_icl_multi=args.use_token_icl_multi)
         
         print(
             f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples. steps in one epoch: {args.steps_per_epoch}"
@@ -400,12 +423,19 @@ def main(args):
         },
         "gradient_clipping": 1.0,
         "zero_optimization": {
-            "stage": 2,
+            "stage": 3 if getattr(args, 'training_stage', 0) == 1 else 2,
             "contiguous_gradients": True,
             "overlap_comm": True,
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
             "allgather_bucket_size": 5e8,
+            **({"stage3_param_persistence_threshold": 1e4,
+                "stage3_max_live_parameters": 1e9,
+                "stage3_prefetch_bucket_size": 5e7,
+                "stage3_gather_16bit_weights_on_model_save": True,
+                "offload_param": {"device": "cpu", "pin_memory": True},
+                "offload_optimizer": {"device": "cpu", "pin_memory": True},
+               } if getattr(args, 'training_stage', 0) == 1 else {}),
         },
     }
 
@@ -532,10 +562,10 @@ def train(
     unscale_mask_losses = AverageMeter("unscale_mask_loss", ":.4f")
     unscale_mask_iou_losses = AverageMeter("unscale_mask_iou_loss", ":.4f")
     unscale_mask_focal_losses = AverageMeter("unscale_mask_focal_loss", ":.4f")
+    align_losses = AverageMeter("AlignLoss", ":.4f")
+    seg_weak_losses = AverageMeter("SegWeakLoss", ":.4f")
 
-    progress = ProgressMeter(
-        args.steps_per_epoch,
-        [
+    progress_meters = [
             model.global_steps,
             batch_time,
             data_time,
@@ -546,7 +576,13 @@ def train(
             unscale_mask_dice_losses,
             unscale_mask_iou_losses,
             unscale_mask_focal_losses,
-        ],
+        ]
+    if hasattr(args, 'training_stage') and args.training_stage == 1:
+        progress_meters.extend([align_losses, seg_weak_losses])
+
+    progress = ProgressMeter(
+        args.steps_per_epoch,
+        progress_meters,
         prefix="Epoch: [{}]".format(epoch),
     )
 
@@ -604,6 +640,8 @@ def train(
             unscale_mask_loss = output_dict["unscale_mask_loss"]
             unscale_mask_iou_loss = output_dict["unscale_mask_iou_loss"]
             unscale_mask_focal_loss = output_dict["unscale_mask_focal_loss"]
+            loss_align = output_dict.get("loss_align", torch.zeros_like(loss))
+            loss_seg_weak = output_dict.get("loss_seg_weak", torch.zeros_like(loss))
 
             losses.update(loss.item(), input_dict["images"].size(0))
             ce_losses.update(ce_loss.item(), input_dict["images"].size(0))
@@ -616,6 +654,9 @@ def train(
                 unscale_mask_losses.update(unscale_mask_loss.item(), input_dict["images"].size(0))
                 unscale_mask_iou_losses.update(unscale_mask_iou_loss.item(), input_dict["images"].size(0))
                 unscale_mask_focal_losses.update(unscale_mask_focal_loss.item(), input_dict["images"].size(0))
+            if hasattr(args, 'training_stage') and args.training_stage == 1:
+                align_losses.update(loss_align.item(), input_dict["images"].size(0))
+                seg_weak_losses.update(loss_seg_weak.item(), input_dict["images"].size(0))
             # compute gradient and do SGD step
             model.backward(loss)
             model.step()
@@ -667,6 +708,15 @@ def train(
                 writer.add_scalar("train/unscale_mask_iou_losses", unscale_mask_iou_losses.avg, model.global_steps)
                 writer.add_scalar("train/unscale_mask_focal_losses", unscale_mask_focal_losses.avg, model.global_steps)
 
+                # SGCAFE Stage 1 日志
+                if hasattr(args, 'training_stage') and args.training_stage == 1:
+                    writer.add_scalar("train/loss_align", align_losses.avg, model.global_steps)
+                    writer.add_scalar("train/loss_seg_weak", seg_weak_losses.avg, model.global_steps)
+                    # 监控 gate 均值
+                    with torch.no_grad():
+                        gate_bias = model.module.get_model().sgcafe.gate_proj.bias.data.mean().item()
+                        writer.add_scalar("train/sgcafe_gate_bias_mean", gate_bias, model.global_steps)
+
             batch_time.reset()
             data_time.reset()
             losses.reset()
@@ -679,6 +729,8 @@ def train(
             unscale_mask_losses.reset()
             unscale_mask_iou_losses.reset()
             unscale_mask_focal_losses.reset()
+            align_losses.reset()
+            seg_weak_losses.reset()
 
         if model.global_steps != 0:
             curr_lr = scheduler.get_last_lr()

@@ -150,10 +150,24 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().get_vision_tower()(images)
 
         # SGCAFE: 如果有 support，在 CLIP 特征空间做 cross-attention 增强
+        sgcafe_module = self.get_model().sgcafe
+        # 清除上一次的附加输出
+        self.get_model()._sgcafe_extras = None
         if support_images is not None and support_mask_weights is not None:
-            support_features = self.get_model().get_vision_tower()(support_images)
-            image_features, _ = self.get_model().sgcafe(
-                image_features, support_features, support_mask_weights)
+            if not getattr(self.config, 'bypass_sgcafe', False):
+                if sgcafe_module.training or getattr(sgcafe_module, '_trained', False):
+                    support_features = self.get_model().get_vision_tower()(support_images)
+                    image_features, attn_map, support_dropped = sgcafe_module(
+                        image_features, support_features, support_mask_weights)
+                    # 训练时存储附加输出用于辅助损失计算
+                    if sgcafe_module.training:
+                        aux_pred = sgcafe_module.aux_forward(image_features)
+                        self.get_model()._sgcafe_extras = {
+                            'attn_map': attn_map,
+                            'aux_pred': aux_pred,
+                            'support_dropped': support_dropped,
+                            'support_mask_weights': support_mask_weights,
+                        }
 
         projected_image_features = self.get_model().mm_projector(image_features)
 
@@ -169,7 +183,7 @@ class LlavaMetaForCausalLM(ABC):
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, attention_mask, past_key_values, labels, images, region_masks, valid_region_masks_bool,
-        support_images=None, support_mask_weights=None
+        support_images=None, support_mask_weights=None, icl_region_clip=None
     ):
         if region_masks is None:
             region_flag = False
@@ -199,17 +213,27 @@ class LlavaMetaForCausalLM(ABC):
             assert region_flag == False
             concat_images = torch.cat([image for image in images], dim=0)
             raw_image_features, image_features, region_feature_map = self.encode_images(concat_images, region_flag, region_geo_sampler)
-            # image_features = self.encode_images(concat_images)
-            split_sizes = [image.shape[0] for image in images]
-            image_features = torch.split(image_features, split_sizes, dim=0)
-            image_features = [x.flatten(0, 1) for x in image_features]
+            # image_features: (B*num_images, 576, dim)
+            # 拆成每张图一个元素: list of (576, dim) tensors
+            # cur_image_idx 全局递增，对 batch_idx=0 的第 1/2/3 个 <image> 分别取 [0]/[1]/[2]
+            # 对 batch_idx=1 的第 1/2/3 个 <image> 分别取 [num_images]/[num_images+1]/[num_images+2]
+            image_features = list(image_features)  # list of (576, dim) tensors
         else:
             raw_image_features, image_features, region_feature_map = self.encode_images(
                 images, region_flag, region_geo_sampler,
                 support_images=support_images, support_mask_weights=support_mask_weights)
         if region_flag:
+            # Region ICL: 用 support 图的 CLIP 特征替换 query 图的 region_feature_map
+            if icl_region_clip is not None:
+                icl_region_clip = icl_region_clip.to(device=images.device, dtype=images.dtype)
+                icl_features = self.get_model().get_vision_tower()(icl_region_clip)
+                region_feature_map = self.get_model().region_fea_adapter(icl_features)
+
             valid_region_masks_bool = torch.tensor([any(item) for item in valid_region_masks_bool])
             region_feature_map = region_feature_map[valid_region_masks_bool]
+
+            # 确保 region_masks 与 region_feature_map 在同一设备上
+            region_masks = [m.to(region_feature_map.device) if hasattr(m, 'to') else m for m in region_masks]
 
             if region_geo_sampler:
                 # pdb.set_trace()
@@ -354,7 +378,8 @@ class LlavaMetaForCausalLM(ABC):
                 if region_flag and valid_region_masks_bool[batch_idx] is not None:
                     for idx,indice in enumerate(region_indices):
                         region_features_idx = torch.sum(valid_region_masks_bool[:batch_idx+1]).item() - 1
-                        text_input_embeds = torch.cat((text_input_embeds[:indice], region_features[region_features_idx][idx].unsqueeze(0), text_input_embeds[indice:]))
+                        region_feat = region_features[region_features_idx][idx].unsqueeze(0).to(text_input_embeds.device)
+                        text_input_embeds = torch.cat((text_input_embeds[:indice], region_feat, text_input_embeds[indice:]))
                 else:
                     if region_flag:
                         assert region_features[batch_idx] is None

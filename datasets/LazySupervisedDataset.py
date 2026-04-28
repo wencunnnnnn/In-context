@@ -260,7 +260,12 @@ def extract_masks_fun(source, mask_root_path, pattern=r'<mask>(.*?)</mask>'):
         mask_name_lst = re.findall(pattern, str(item['value']))
         if mask_name_lst:
             assert len(mask_name_lst) == 1, "Only one mask is supported in one turns."
-            mask_path = os.path.join(mask_root_path, mask_name_lst[0])
+            mask_name = mask_name_lst[0].strip()
+            if not mask_name:
+                continue
+            mask_path = os.path.join(mask_root_path, mask_name)
+            if os.path.isdir(mask_path):
+                continue
             mask = Image.open(mask_path).convert('L')
             mask_np = np.array(mask)
 
@@ -411,7 +416,11 @@ class LazySupervisedDataset(Dataset):
                  data_args: DataArguments,
                  image_size=1024,
                  use_visual_icl=False,
-                 support_pool_path=None):
+                 support_pool_path=None,
+                 use_token_icl_concat=False,
+                 use_token_icl_multi=False,
+                 use_region_icl=False,
+                 region_icl_self=False):
         super(LazySupervisedDataset, self).__init__()
         list_data_dict = json.load(open(data_path, "r"))
 
@@ -423,11 +432,22 @@ class LazySupervisedDataset(Dataset):
         self.clip_img_size = 336
         self.transform_clip = ResizeLongestSide(self.clip_img_size)
 
-        # Visual ICL 配置
+        # Visual ICL 配置 (SGCAFE)
         self.use_visual_icl = use_visual_icl
+        # Token ICL 配置 (直接将 support 图编码成 token 输入 LLM)
+        self.use_token_icl_concat = use_token_icl_concat
+        self.use_token_icl_multi = use_token_icl_multi
+        # Region ICL 配置 (通过 Vision Prompt Encoder 注入 support 区域特征)
+        self.use_region_icl = use_region_icl
+        self.region_icl_self = region_icl_self
         self.support_pool = None
-        if use_visual_icl and support_pool_path:
-            rank0_print(f"[Visual ICL] 加载 support pool: {support_pool_path}")
+        self.pool_lv1 = {}
+        self.pool_lv2 = {}
+        self.pool_lv3 = {}
+        self.test_key_map = {}
+        need_support_pool = use_visual_icl or use_token_icl_concat or use_token_icl_multi or use_region_icl
+        if need_support_pool and support_pool_path:
+            rank0_print(f"[ICL] 加载 support pool: {support_pool_path}")
             with open(support_pool_path, "rb") as f:
                 pool_data = pickle.load(f)
             self.pool_lv1 = pool_data["pool_lv1"]
@@ -435,7 +455,13 @@ class LazySupervisedDataset(Dataset):
             self.pool_lv3 = pool_data["pool_lv3"]
             self.test_key_map = pool_data["test_key_map"]
             self.support_pool = True
-            rank0_print(f"[Visual ICL] Pool loaded: Lv1={len(self.pool_lv1)}, test_keys={len(self.test_key_map)}")
+            rank0_print(f"[ICL] Pool loaded: Lv1={len(self.pool_lv1)}, test_keys={len(self.test_key_map)}")
+
+        # ---------- 零样本 ICL: 从测试集自身构建 support pool ----------
+        if need_support_pool:
+            self._build_zeroshot_pool(list_data_dict)
+            if self.support_pool:
+                rank0_print(f"[Zeroshot ICL] Pool built from test set: Lv1={len(self.pool_lv1)}, Lv2={len(self.pool_lv2)}, Lv3={len(self.pool_lv3)}")
 
 
         self.list_data_dict = []
@@ -525,23 +551,116 @@ class LazySupervisedDataset(Dataset):
 
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        # 跳过 mask 文件缺失的样本（如 masks_merged 目录不存在），随机选取另一个样本
+        # 跳过 mask 文件缺失或路径异常的样本，随机选取另一个样本
         for _ in range(10):
             try:
                 return self._getitem(i)
-            except FileNotFoundError:
+            except (FileNotFoundError, IsADirectoryError):
                 i = random.randint(0, len(self.list_data_dict) - 1)
         return self._getitem(i)
 
-    def _get_support_data(self, sample_id):
+    def _build_zeroshot_pool(self, list_data_dict):
+        """
+        零样本 ICL: 从测试集自身构建三级 support pool。
+        遍历测试集每条数据，解析 (dataset, modality, cls)，
+        将其 image 和 mask 路径作为 support candidate 加入三级索引。
+        只有在外部 pool 中查不到的样本才需要从测试集自身获取 support。
+        """
+        import re as _re
+        added = 0
+        for item in list_data_dict:
+            sample_id = item.get('id', '')
+            # 如果该 id 已在外部 pool 的 test_key_map 中，跳过
+            if sample_id in self.test_key_map:
+                continue
+            conv_text = item['conversations'][0]['value'] if item.get('conversations') else None
+            if not conv_text:
+                continue
+            meta = self._parse_id_to_metadata(sample_id, conv_text)
+            if meta is None:
+                continue
+            dataset, modality, cls = meta
+
+            # 从 gpt response 中提取 mask 路径
+            gpt_val = item['conversations'][1]['value'] if len(item.get('conversations', [])) > 1 else ''
+            mask_match = _re.search(r'<mask>(.*?)</mask>', gpt_val)
+            if not mask_match:
+                continue
+            mask_path = mask_match.group(1)
+            image_path = item.get('image', '')
+            if not image_path:
+                continue
+
+            entry = {"image": image_path, "mask": mask_path}
+
+            # 加入三级索引
+            key_lv1 = (dataset, modality, cls)
+            key_lv2 = (modality, cls)
+            key_lv3 = (cls,)
+            self.pool_lv1.setdefault(key_lv1, []).append(entry)
+            self.pool_lv2.setdefault(key_lv2, []).append(entry)
+            self.pool_lv3.setdefault(key_lv3, []).append(entry)
+
+            # 注册到 test_key_map，供 _get_support_data 查询
+            self.test_key_map[sample_id] = (dataset, modality, cls)
+            added += 1
+
+        if added > 0:
+            self.support_pool = True
+            rank0_print(f"[Zeroshot ICL] Added {added} test samples to support pool")
+
+    @staticmethod
+    def _parse_id_to_metadata(sample_id, conv_text):
+        """
+        从样本 id 和 conversation 文本中解析 (dataset, modality, cls)。
+        ID 格式: ct_00--MSD_HepaticVessel--hepaticvessel_057--x_0013
+        conv 格式: "segments the hepatic tumor in this image"
+        """
+        import re
+        parts = sample_id.split('--')
+        if len(parts) < 2:
+            return None
+        modality = parts[0].split('_')[0]  # "ct_00" -> "ct"
+        dataset = parts[1]                  # "MSD_HepaticVessel"
+
+        # 从 conversation 文本中提取类别
+        patterns = [
+            r'segments?\s+the\s+(.+?)\s+in\s+this',
+            r'segmenting\s+the\s+(.+?)\s+in\s+this',
+            r'segment\s+out\s+the\s+(.+?)\s+in\s+this',
+            r'segment\s+the\s+(.+?)\s+in\s+this',
+            r'mask\s+(?:for|of)\s+the\s+(.+?)\s+in\s+this',
+        ]
+        cls = None
+        for p in patterns:
+            m = re.search(p, conv_text, re.IGNORECASE)
+            if m:
+                cls = m.group(1).strip().replace(' ', '_')
+                break
+        if cls is None:
+            return None
+        return (dataset, modality, cls)
+
+    def _get_support_data(self, sample_id, conv_text=None):
         """
         根据样本 id，从 support pool 中匹配，返回原始 support RGB 图和二值 mask。
+        支持推理（test_key_map）和训练（从 id+conv 解析 metadata）两种模式。
         返回 (support_rgb: np.ndarray, mask_binary: np.ndarray) 或 (None, None)。
         """
-        if not self.support_pool or sample_id not in self.test_key_map:
+        if not self.support_pool:
             return None, None
 
-        dataset, modality, cls = self.test_key_map[sample_id]
+        # 推理模式：直接查 test_key_map
+        if sample_id in self.test_key_map:
+            dataset, modality, cls = self.test_key_map[sample_id]
+        elif conv_text is not None:
+            # 训练模式：从 id + conversation 文本解析 metadata
+            meta = self._parse_id_to_metadata(sample_id, conv_text)
+            if meta is None:
+                return None, None
+            dataset, modality, cls = meta
+        else:
+            return None, None
 
         # 三级降级匹配
         candidates = None
@@ -555,8 +674,13 @@ class LazySupervisedDataset(Dataset):
         if not candidates:
             return None, None
 
+        # 排除自身（防止 identity shortcut）
+        filtered = [e for e in candidates if sample_id not in e["image"]]
+        if not filtered:
+            return None, None
+
         # 随机选一个 support 样本
-        entry = random.choice(candidates)
+        entry = random.choice(filtered)
         img_path = os.path.join(self.data_args.image_folder, entry["image"])
         mask_path = os.path.join(self.data_args.image_folder, entry["mask"])
 
@@ -574,19 +698,18 @@ class LazySupervisedDataset(Dataset):
             return None, None
 
     @staticmethod
-    def _make_support_mask_weights(mask_binary, num_patches=575):
+    def _make_support_mask_weights(mask_binary, num_patches=576):
         """
         将 support 二值 mask 下采样到 CLIP patch grid (24x24=576)，
-        去掉 CLS 对应位后得到 575 维 mask weights。
+        select_feature="patch" 去掉 CLS 后仍为 576 tokens (336/14=24, 24x24=576)。
         """
         mask_resized = cv2.resize(mask_binary, (24, 24), interpolation=cv2.INTER_AREA)
         mask_flat = mask_resized.flatten()  # (576,)
-        # CLIP ViT-L/14 select_feature="patch" 取 [:, 1:] 去掉 CLS → 575 tokens
         mask_weights = torch.tensor(mask_flat[:num_patches], dtype=torch.float32)
         return mask_weights
 
     def _getitem(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
+        sources = copy.deepcopy(self.list_data_dict[i])
         answer_type = sources.get('answer_type', None)
         if isinstance(i, int):
             sources = [sources]
@@ -643,7 +766,9 @@ class LazySupervisedDataset(Dataset):
             support_mask_weights = None
             if self.use_visual_icl:
                 sample_id = self.list_data_dict[i].get('id', '')
-                support_rgb, support_mask_binary = self._get_support_data(sample_id)
+                # 传入 conversation 文本，用于训练集模式下解析类别
+                conv_text = self.list_data_dict[i]['conversations'][0]['value'] if self.list_data_dict[i].get('conversations') else None
+                support_rgb, support_mask_binary = self._get_support_data(sample_id, conv_text=conv_text)
                 if support_rgb is not None:
                     # 对 support 图做和 query 相同的 CLIP 预处理（不做 overlay）
                     support_resized = self.transform_clip.apply_image(support_rgb)
@@ -656,10 +781,138 @@ class LazySupervisedDataset(Dataset):
                         support_clip = processor.preprocess(
                             self.preprocess(torch.from_numpy(support_rgb).permute(2, 0, 1).contiguous(), False),
                             return_tensors='pt')['pixel_values'][0]
-                    # 生成 mask weights (575,)
+                    # 生成 mask weights (576,)
                     support_mask_weights = self._make_support_mask_weights(support_mask_binary)
                     # prompt 保持单图格式，不插入第二个 <image> token
                     # 不修改对话内容，LLM 不需要知道 support 的存在
+
+            # ------------ Token ICL: support 图编码成 token 直接输入 LLM ------------
+            token_icl_extra_clips = []  # 额外的 CLIP 图像 tensor（放在 query 前面）
+            if self.use_token_icl_concat or self.use_token_icl_multi:
+                sample_id = self.list_data_dict[i].get('id', '')
+                conv_text = self.list_data_dict[i]['conversations'][0]['value'] if self.list_data_dict[i].get('conversations') else None
+                support_rgb, support_mask_binary = self._get_support_data(sample_id, conv_text=conv_text)
+                if support_rgb is not None:
+                    if self.use_token_icl_concat:
+                        # 方案A: 横向拼接 support 原图 和 mask 黑白图
+                        mask_3ch = np.stack([support_mask_binary * 255] * 3, axis=-1).astype(np.uint8)
+                        # 将 mask resize 到和 support_rgb 同样大小
+                        mask_3ch = cv2.resize(mask_3ch, (support_rgb.shape[1], support_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+                        concat_img = np.concatenate([support_rgb, mask_3ch], axis=1)  # 横向拼接
+                        # CLIP 预处理
+                        concat_resized = self.transform_clip.apply_image(concat_img)
+                        concat_tensor = self.preprocess(
+                            torch.from_numpy(concat_resized).permute(2, 0, 1).contiguous(),
+                            self.clip_img_size, normalize=False)
+                        if self.data_args.image_aspect_ratio == 'pad':
+                            concat_clip = processor.preprocess(concat_tensor, return_tensors='pt')['pixel_values'][0]
+                        else:
+                            concat_clip = processor.preprocess(
+                                self.preprocess(torch.from_numpy(concat_img).permute(2, 0, 1).contiguous(), False),
+                                return_tensors='pt')['pixel_values'][0]
+                        token_icl_extra_clips = [concat_clip]
+                        # 修改 conversation 文本为 ICL 格式（2图）
+                        # 提取原始 question（去掉 <image> token、换行和末尾标点）
+                        original_question = sources[0]['conversations'][0]['value']
+                        original_question = original_question.replace(DEFAULT_IMAGE_TOKEN, '').strip()
+                        original_question = original_question.rstrip('.?!,;')
+                        # 首字母小写，与前缀衔接更自然
+                        if original_question and original_question[0].isupper():
+                            original_question = original_question[0].lower() + original_question[1:]
+                        icl_prompt = (
+                            DEFAULT_IMAGE_TOKEN + "\n" + DEFAULT_IMAGE_TOKEN + "\n"
+                            "The first image is a reference (left: scan, right: mask). "
+                            "For the second image, " + original_question + " by referring to the example."
+                        )
+                        sources[0]['conversations'][0]['value'] = icl_prompt
+
+                    elif self.use_token_icl_multi:
+                        # 方案B: 3 图输入（support 原图 + mask 黑白图 + query 原图）
+                        # support 原图 CLIP 预处理
+                        s_resized = self.transform_clip.apply_image(support_rgb)
+                        s_tensor = self.preprocess(
+                            torch.from_numpy(s_resized).permute(2, 0, 1).contiguous(),
+                            self.clip_img_size, normalize=False)
+                        if self.data_args.image_aspect_ratio == 'pad':
+                            s_clip = processor.preprocess(s_tensor, return_tensors='pt')['pixel_values'][0]
+                        else:
+                            s_clip = processor.preprocess(
+                                self.preprocess(torch.from_numpy(support_rgb).permute(2, 0, 1).contiguous(), False),
+                                return_tensors='pt')['pixel_values'][0]
+                        # mask 黑白图 CLIP 预处理
+                        mask_3ch = np.stack([support_mask_binary * 255] * 3, axis=-1).astype(np.uint8)
+                        mask_3ch = cv2.resize(mask_3ch, (support_rgb.shape[1], support_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+                        m_resized = self.transform_clip.apply_image(mask_3ch)
+                        m_tensor = self.preprocess(
+                            torch.from_numpy(m_resized).permute(2, 0, 1).contiguous(),
+                            self.clip_img_size, normalize=False)
+                        if self.data_args.image_aspect_ratio == 'pad':
+                            m_clip = processor.preprocess(m_tensor, return_tensors='pt')['pixel_values'][0]
+                        else:
+                            m_clip = processor.preprocess(
+                                self.preprocess(torch.from_numpy(mask_3ch).permute(2, 0, 1).contiguous(), False),
+                                return_tensors='pt')['pixel_values'][0]
+                        token_icl_extra_clips = [s_clip, m_clip]
+                        # 修改 conversation 文本为 ICL 格式（3图）
+                        # 提取原始 question（去掉 <image> token、换行和末尾标点）
+                        original_question = sources[0]['conversations'][0]['value']
+                        original_question = original_question.replace(DEFAULT_IMAGE_TOKEN, '').strip()
+                        original_question = original_question.rstrip('.?!,;')
+                        # 首字母小写，与前缀衔接更自然
+                        if original_question and original_question[0].isupper():
+                            original_question = original_question[0].lower() + original_question[1:]
+                        icl_prompt = (
+                            DEFAULT_IMAGE_TOKEN + "\n" + DEFAULT_IMAGE_TOKEN + "\n" + DEFAULT_IMAGE_TOKEN + "\n"
+                            "Image 1 is a reference scan and Image 2 is its target mask. "
+                            "Based on this context, for Image 3, " + original_question + "."
+                        )
+                        sources[0]['conversations'][0]['value'] = icl_prompt
+
+            # ------------ Region ICL: support 区域特征通过 Vision Prompt Encoder 注入 ------------
+            icl_region_clip = None
+            icl_region_mask = None
+            if self.use_region_icl:
+                if self.region_icl_self and len(masks) > 0:
+                    # 极端实验：用 query 自身的图和 GT mask 作为上下文
+                    support_rgb = image_rgb
+                    support_mask_binary = masks[0].astype(np.float32)
+                else:
+                    sample_id = self.list_data_dict[i].get('id', '')
+                    conv_text = self.list_data_dict[i]['conversations'][0]['value'] if self.list_data_dict[i].get('conversations') else None
+                    support_rgb, support_mask_binary = self._get_support_data(sample_id, conv_text=conv_text)
+                if support_rgb is not None:
+                    # 1. CLIP 预处理 support 图
+                    s_resized = self.transform_clip.apply_image(support_rgb)
+                    s_tensor = self.preprocess(
+                        torch.from_numpy(s_resized).permute(2, 0, 1).contiguous(),
+                        self.clip_img_size, normalize=False)
+                    if self.data_args.image_aspect_ratio == 'pad':
+                        icl_region_clip = processor.preprocess(s_tensor, return_tensors='pt')['pixel_values'][0]
+                    else:
+                        icl_region_clip = processor.preprocess(
+                            self.preprocess(torch.from_numpy(support_rgb).permute(2, 0, 1).contiguous(), False),
+                            return_tensors='pt')['pixel_values'][0]
+
+                    # 2. 下采样 support mask 到 24x24（与现有 region_mask 处理一致）
+                    mask_uint8 = (support_mask_binary * 255).astype(np.uint8)
+                    mask_resized = self.transform_clip.apply_image(mask_uint8)
+                    mask_tensor = self.preprocess(
+                        torch.from_numpy(mask_resized).contiguous(),
+                        self.clip_img_size, normalize=False, is_mask=True)
+                    icl_region_mask = cv2.resize(np.array(mask_tensor), None, fx=1/14, fy=1/14, interpolation=cv2.INTER_NEAREST)
+
+                    # 3. 加入 region_masks（复用现有 region 处理流程）
+                    region_masks.append(icl_region_mask)
+                    is_valid_region = True
+
+                    # 4. 在 <image>\n 之后插入 <region> 引用
+                    # 注意: medplib_arch.py 中 assert <region> 不能出现在 <image> 之前
+                    original_value = sources[0]['conversations'][0]['value']
+                    sources[0]['conversations'][0]['value'] = original_value.replace(
+                        DEFAULT_IMAGE_TOKEN + "\n",
+                        DEFAULT_IMAGE_TOKEN + "\n" + "The <region></region> token provides a visual example. ",
+                        1
+                    )
 
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
@@ -684,13 +937,20 @@ class LazySupervisedDataset(Dataset):
 
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
-            data_dict['image_clip'] = image_clip
+            # Token ICL: image_clip 存为 list（support 图在前，query 在后）
+            if len(token_icl_extra_clips) > 0:
+                data_dict['image_clip'] = token_icl_extra_clips + [image_clip]  # list of tensors
+            else:
+                data_dict['image_clip'] = image_clip
             data_dict['masks'] = masks
             data_dict['region_masks'] = region_masks
             # Visual ICL (SGCAFE): 传递 support clip 图像 + mask weights
             if self.use_visual_icl and support_clip is not None:
                 data_dict['support_clip'] = support_clip
                 data_dict['support_mask_weights'] = support_mask_weights
+            # Region ICL: 传递 support 图的 CLIP tensor
+            if self.use_region_icl and icl_region_clip is not None:
+                data_dict['icl_region_clip'] = icl_region_clip
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size

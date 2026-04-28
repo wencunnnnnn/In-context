@@ -338,6 +338,7 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             valid_region_masks_bool: Optional[List[torch.BoolTensor]] = None,
             support_images: Optional[torch.FloatTensor] = None,
             support_mask_weights: Optional[torch.FloatTensor] = None,
+            icl_region_clip: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, MoECausalLMOutputWithPast]:
         if inputs_embeds is None:
             (
@@ -358,10 +359,8 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 valid_region_masks_bool,
                 support_images=support_images,
                 support_mask_weights=support_mask_weights,
+                icl_region_clip=icl_region_clip,
             )
-        # import ipdb
-        # ipdb.set_trace()
-        # print('after prepare_inputs_labels_for_multimodal')
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -373,8 +372,6 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        # import ipdb
-        # ipdb.set_trace()
         hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
             assert NotImplementedError
@@ -405,17 +402,16 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             loss = loss_fct(shift_logits, shift_labels)
 
         moe_loss, moe_losses = None, []
-        if len(outputs[-1]) > 0 and labels is not None:
-            moe_loss_list = outputs[-1]
-            # import ipdb
-            # ipdb.set_trace()
+        moe_loss_list = getattr(outputs, 'moe_loss_list', None) or (outputs[-1] if not isinstance(outputs, dict) and hasattr(outputs, '__getitem__') and not hasattr(outputs, 'keys') else None)
+        if moe_loss_list is not None and len(moe_loss_list) > 0 and labels is not None:
             for moe_loss in moe_loss_list:
-                if moe_loss is not None:
+                if moe_loss is not None and isinstance(moe_loss, torch.Tensor) and moe_loss.dim() == 0:
                     moe_losses.append(moe_loss.to(logits.device))
-            moe_loss = self.router_aux_loss_coef * sum(moe_losses)
-            if labels is not None:
-                # print(loss, sum(moe_losses), loss + moe_loss)
+            if moe_losses:
+                moe_loss = self.router_aux_loss_coef * sum(moe_losses)
                 loss += moe_loss
+            else:
+                moe_loss = None
         # import ipdb
         # ipdb.set_trace()
         # if not return_dict:
@@ -431,7 +427,7 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             # past_key_values=None,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            moe_loss_list=outputs.moe_loss_list,
+            moe_loss_list=getattr(outputs, 'moe_loss_list', None),
         )
 
     # def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
@@ -454,6 +450,9 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images=None,
         region_masks=[],
         valid_region_masks_bool=[],
+        support_images=None,
+        support_mask_weights=None,
+        icl_region_clip=None,
         **kwargs
     ):
         if past_key_values:
@@ -465,6 +464,13 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         else:
             model_inputs = {"input_ids": input_ids}
 
+        # 后续步骤仍需 images 用于 attention_mask 扩展（见 prepare_inputs_labels_for_multimodal），
+        # 但不需要 support 数据（SGCAFE 只在第一步执行）
+        if past_key_values is not None:
+            support_images = None
+            support_mask_weights = None
+            icl_region_clip = None
+
         model_inputs.update(
             {
                 "past_key_values": past_key_values,
@@ -473,6 +479,9 @@ class MedPLIBMoELlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 "images": images,
                 "region_masks": region_masks,
                 "valid_region_masks_bool": valid_region_masks_bool,
+                "support_images": support_images,
+                "support_mask_weights": support_mask_weights,
+                "icl_region_clip": icl_region_clip,
             }
         )
         return model_inputs
